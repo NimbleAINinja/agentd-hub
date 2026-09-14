@@ -93,21 +93,31 @@ pub async fn discover(
     };
     let targets = if targets.is_empty() {
         match hosts_file {
-            Some(path) => {
-                let bytes =
-                    tokio::fs::read(path)
-                        .await
-                        .map_err(|source| DiscoveryError::HostsFile {
-                            path: path.to_owned(),
-                            source,
-                        })?;
-                hosts_targets(&bytes)
-            }
+            Some(path) => read_hosts_file(path).await?,
             None => Vec::new(),
         }
     } else {
         targets
     };
+    probe_targets(programs, deadlines, targets, shutdown).await
+}
+
+pub async fn discover_sources(
+    programs: &Programs,
+    deadlines: Deadlines,
+    sources_file: &Path,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Vec<SourceSeed>, DiscoveryError> {
+    let targets = read_hosts_file(sources_file).await?;
+    probe_targets(programs, deadlines, targets, shutdown).await
+}
+
+async fn probe_targets(
+    programs: &Programs,
+    deadlines: Deadlines,
+    targets: Vec<String>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<Vec<SourceSeed>, DiscoveryError> {
     if targets.is_empty() {
         return Err(DiscoveryError::NoTargets);
     }
@@ -117,6 +127,16 @@ pub async fn discover(
         seeds.push(probe_source(programs, deadlines.probe, machine, &mut shutdown).await?);
     }
     Ok(seeds)
+}
+
+async fn read_hosts_file(path: &Path) -> Result<Vec<String>, DiscoveryError> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|source| DiscoveryError::HostsFile {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(hosts_targets(&bytes))
 }
 
 pub fn tailscale_targets(bytes: &[u8]) -> Option<Vec<String>> {
@@ -489,5 +509,55 @@ esac
             ["a", "b"]
         );
         assert_eq!(std::fs::read_to_string(log).unwrap(), "a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn sources_file_skips_tailscale_and_uses_only_configured_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let tailscale = directory.path().join("tailscale");
+        let ssh = directory.path().join("ssh");
+        let log = directory.path().join("probes");
+        let sources = directory.path().join("sources");
+        executable(
+            &tailscale,
+            &format!(
+                "#!/bin/sh\necho called > {}\nexit 1\n",
+                directory.path().join("tailscale-called").display()
+            ),
+        );
+        executable(
+            &ssh,
+            &format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in configured-a|configured-b) echo \"$arg\" >> {};; esac; done\nexit 255\n",
+                log.display()
+            ),
+        );
+        std::fs::write(&sources, "configured-b\n# ignored\nconfigured-a\n").unwrap();
+        let programs = Programs { tailscale, ssh };
+        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::shutdown_channel();
+        let seeds = discover_sources(
+            &programs,
+            Deadlines {
+                tailscale: Duration::from_secs(1),
+                probe: Duration::from_secs(1),
+                watch_first_frame: Duration::from_secs(1),
+            },
+            &sources,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|seed| seed.machine.as_str())
+                .collect::<Vec<_>>(),
+            ["configured-a", "configured-b"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "configured-a\nconfigured-b\n"
+        );
+        assert!(!directory.path().join("tailscale-called").exists());
     }
 }

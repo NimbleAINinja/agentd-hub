@@ -24,7 +24,7 @@ Download published builds from [GitHub Releases](https://github.com/clickety-cla
 
 ### Install a release
 
-The example below installs v0.1.0 from its published archive. Run the steps in
+The example below installs v0.1.1 from its published archive. Run the steps in
 one shell session. Use a tagged release for deployments.
 
 1. Choose a version from [GitHub Releases](https://github.com/clickety-clacks/agentd-hub/releases)
@@ -32,7 +32,7 @@ one shell session. Use a tagged release for deployments.
 
    ```sh
    cd "$(mktemp -d)"
-   ver=0.1.0
+   ver=0.1.1
    base="https://github.com/clickety-clacks/agentd-hub/releases/download/v${ver}"
    curl -fsSLO "${base}/agentd-hub-${ver}-x86_64-unknown-linux-gnu.tar.gz"
    curl -fsSLO "${base}/SHA256SUMS"
@@ -82,6 +82,13 @@ Start with the hosts file:
 agentd-hub --hosts-file ./hosts.txt
 ```
 
+To use only the targets in a file and skip Tailscale discovery, use
+`--sources-file`. This is the right choice for a fixed deployment topology:
+
+```sh
+agentd-hub --sources-file ./sources.txt
+```
+
 To use IPv6 loopback instead:
 
 ```sh
@@ -91,6 +98,9 @@ agentd-hub --listen '[::1]:8787' --hosts-file ./hosts.txt
 Tailscale discovery runs first. The hosts file is used only when Tailscale
 fails, returns invalid JSON, or returns no machine. Each non-empty,
 non-comment line is one SSH target.
+
+`--sources-file` and `--hosts-file` are mutually exclusive. Source names belong
+in the deployment file, not in the Agentd Hub binary or repository.
 
 ### HTTP endpoints
 

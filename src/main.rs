@@ -1,4 +1,6 @@
-use agentd_hub::discovery::{Deadlines, DiscoveryError, Programs, discover, unix_time_ms};
+use agentd_hub::discovery::{
+    Deadlines, DiscoveryError, Programs, discover, discover_sources, unix_time_ms,
+};
 use agentd_hub::lifecycle::{shutdown_channel, shutdown_requested};
 use agentd_hub::state::HubState;
 use agentd_hub::supervisor::spawn_watchers;
@@ -6,11 +8,14 @@ use agentd_hub::web;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: agentd-hub [--listen LOOPBACK:PORT] [--hosts-file PATH]";
+const USAGE: &str =
+    "usage: agentd-hub [--listen LOOPBACK:PORT] [--hosts-file PATH | --sources-file PATH]";
 
+#[derive(Debug)]
 struct Options {
     listen: SocketAddr,
     hosts_file: Option<PathBuf>,
+    sources_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -36,14 +41,18 @@ async fn run() -> Result<(), String> {
     let _signal_task = spawn_signal_listener(shutdown_tx.clone())?;
     let programs = Programs::default();
     let deadlines = Deadlines::default();
-    let seeds = match discover(
-        &programs,
-        deadlines,
-        options.hosts_file.as_deref(),
-        shutdown_rx.clone(),
-    )
-    .await
-    {
+    let discovery = if let Some(path) = options.sources_file.as_deref() {
+        discover_sources(&programs, deadlines, path, shutdown_rx.clone()).await
+    } else {
+        discover(
+            &programs,
+            deadlines,
+            options.hosts_file.as_deref(),
+            shutdown_rx.clone(),
+        )
+        .await
+    };
+    let seeds = match discovery {
         Ok(seeds) => seeds,
         Err(DiscoveryError::Shutdown) => return Ok(()),
         Err(error) => return Err(error.to_string()),
@@ -118,6 +127,7 @@ fn parse_options_from(
 ) -> Result<Option<Options>, String> {
     let mut listen = "127.0.0.1:8787".parse().expect("valid default address");
     let mut hosts_file = None;
+    let mut sources_file = None;
     let mut args = arguments.into_iter();
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -130,6 +140,9 @@ fn parse_options_from(
             "--hosts-file" => {
                 hosts_file = Some(PathBuf::from(args.next().ok_or_else(|| USAGE.to_owned())?));
             }
+            "--sources-file" => {
+                sources_file = Some(PathBuf::from(args.next().ok_or_else(|| USAGE.to_owned())?));
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(None);
@@ -141,7 +154,16 @@ fn parse_options_from(
             _ => return Err(format!("unknown_argument: {argument}\n{USAGE}")),
         }
     }
-    Ok(Some(Options { listen, hosts_file }))
+    if hosts_file.is_some() && sources_file.is_some() {
+        return Err(format!(
+            "conflicting_discovery_options: --hosts-file and --sources-file cannot be used together\n{USAGE}"
+        ));
+    }
+    Ok(Some(Options {
+        listen,
+        hosts_file,
+        sources_file,
+    }))
 }
 
 #[cfg(test)]
@@ -167,5 +189,24 @@ mod tests {
         .unwrap();
         assert!(options.listen.ip().is_loopback());
         assert_eq!(options.hosts_file, Some(PathBuf::from("hosts")));
+        assert_eq!(options.sources_file, None);
+    }
+
+    #[test]
+    fn sources_file_is_exclusive() {
+        let options = parse_options_from(["--sources-file".into(), "sources".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.sources_file, Some(PathBuf::from("sources")));
+        assert_eq!(options.hosts_file, None);
+
+        let error = parse_options_from([
+            "--hosts-file".into(),
+            "fallback".into(),
+            "--sources-file".into(),
+            "sources".into(),
+        ])
+        .unwrap_err();
+        assert!(error.starts_with("conflicting_discovery_options:"));
     }
 }
