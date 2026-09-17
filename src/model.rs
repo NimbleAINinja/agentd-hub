@@ -40,19 +40,40 @@ pub struct AgentId {
     pub start_time_ticks: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Harness {
-    Codex,
-    Claude,
-}
+/// Harness name reported by Agentd. Any well-formed name passes through so a
+/// harness added to Agentd later does not make the hub reject the whole frame.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Harness(String);
+
+const MAX_HARNESS_LEN: usize = 32;
 
 impl Harness {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Harness {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let well_formed = value.len() <= MAX_HARNESS_LEN
+            && value.starts_with(|c: char| c.is_ascii_lowercase())
+            && value
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if well_formed {
+            Ok(Self(value))
+        } else {
+            Err(format!("invalid harness name {value:?}"))
         }
+    }
+}
+
+impl From<Harness> for String {
+    fn from(harness: Harness) -> Self {
+        harness.0
     }
 }
 
@@ -246,7 +267,7 @@ impl AgentdAgent {
             machine: machine.to_owned(),
             instance_id: instance_id.to_owned(),
             id: self.id.clone(),
-            harness: self.harness,
+            harness: self.harness.clone(),
             detected_by: self.detected_by,
             presence: self.presence.clone(),
             cwd: self.cwd.clone(),
@@ -303,5 +324,37 @@ mod tests {
     fn rejects_invalid_required_agent_types() {
         let input = br#"{"type":"snapshot","schema":"agentd.snapshot.v1","instanceId":"i","revision":1,"observedAtUnixMs":1,"scan":{},"agents":[{"id":{"pid":7,"startTimeTicks":9},"harness":7,"detectedBy":"proc_comm","presence":{},"cwd":{},"activity":{}}]}"#;
         assert!(parse_agentd_snapshot(input).is_err());
+    }
+
+    fn frame_with_harness(harness: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"snapshot","schema":"agentd.snapshot.v1","instanceId":"i","revision":1,"observedAtUnixMs":1,"scan":{{}},"agents":[{{"id":{{"pid":7,"startTimeTicks":9}},"harness":{harness},"detectedBy":"proc_comm","presence":{{"state":"present","cause":null}},"cwd":{{"state":"known","value":"/work","cause":null}},"activity":{{"state":"unknown","source":"none","observedAtUnixMs":null}}}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn passes_through_well_formed_unknown_harness() {
+        let parsed = parse_agentd_snapshot(&frame_with_harness(r#""opencode""#)).unwrap();
+        let projected = parsed.agents[0].project("gibson", &parsed.instance_id);
+        assert_eq!(projected.harness_name(), "opencode");
+        let value = serde_json::to_value(&projected).unwrap();
+        assert_eq!(value["harness"], "opencode");
+    }
+
+    #[test]
+    fn rejects_malformed_harness_names() {
+        for harness in [
+            r#""""#,
+            r#""Claude""#,
+            r#""has space""#,
+            r#""<script>""#,
+            r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#,
+        ] {
+            assert!(
+                parse_agentd_snapshot(&frame_with_harness(harness)).is_err(),
+                "accepted {harness}"
+            );
+        }
     }
 }
